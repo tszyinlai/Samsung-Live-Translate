@@ -26,12 +26,9 @@ import android.provider.Settings;
 import android.util.Log;
 
 import org.json.JSONObject;
-import org.json.JSONArray;
 import org.vosk.Model;
 import org.vosk.Recognizer;
 
-import java.util.List;
-import java.util.ArrayList;
 
 /** A foreground service is required for microphone or MediaProjection capture on modern Android. */
 public final class CaptureService extends Service {
@@ -64,8 +61,12 @@ public final class CaptureService extends Service {
     private String lastPartialText = "";
     private long lastTranslationAt = 0L;
     private long lastPartialPostAt = 0L;
-    private int lastPartialChunkIndex = 0;
-    private static final int MIN_PARTIAL_WORDS = 5;
+    // Never confuse a visual line length with a grammatical sentence boundary.
+    // Partial English grows as Vosk recognizes it; translations are provisional.
+    private int lastTranslatedPartialWords = 0;
+    private static final int MIN_PARTIAL_WORDS = 7;
+    private static final int MIN_NEW_WORDS_FOR_TRANSLATION = 3;
+    private static final long PARTIAL_TRANSLATION_INTERVAL_MS = 2200L;
     // Speech and translation have different completion times. Never allow an older
     // asynchronous translation to replace a newer displayed subtitle.
     private long activeSpeechSegmentId = 1L;
@@ -140,7 +141,7 @@ public final class CaptureService extends Service {
             lastPartialText = "";
             lastTranslationAt = 0L;
             lastPartialPostAt = 0L;
-            lastPartialChunkIndex = 0;
+            lastTranslatedPartialWords = 0;
             activeSpeechSegmentId = 1L;
             displayedSpeechSegmentId = 0L;
             nextTranslationRequestId = 0L;
@@ -218,9 +219,11 @@ public final class CaptureService extends Service {
     private void captureLoop(int mode) {
         try (Model model = new Model(ModelInstaller.path(this).getAbsolutePath());
              Recognizer recognizer = new Recognizer(model, SAMPLE_RATE)) {
-            // Vosk's defaults can join several spoken sentences without punctuation.
-            // Prefer a boundary after ~0.45 s silence, with a ~6.5 s safety limit.
-            recognizer.setEndpointerDelays(5.0f, 0.45f, 6.5f);
+            // Do not end an utterance on a natural 0.4-0.6s hesitation.
+            // t_end is seconds of trailing silence; Vosk finalizes on a longer
+            // pause, not on screen width, word count or an arbitrary word gap.
+            // 28s is only a long-utterance safety bound, not a sentence detector.
+            recognizer.setEndpointerDelays(5.0f, 1.25f, 28.0f);
             recognizer.setWords(true);
             AudioRecord input = buildRecorder(mode);
             recorder = input;
@@ -271,80 +274,54 @@ public final class CaptureService extends Service {
     }
 
     /**
-     * Vosk partial text grows as it hears a sentence. Keep the last translated
-     * Chinese visible while waiting for the next translation. In particular, do
-     * NOT replace it with a "recognizing" or "translating" status message.
+     * A partial hypothesis is *one growing utterance*, not a collection of
+     * display-sized snippets. Translating a detached tail such as "in the UK"
+     * destroys context and leads to bad Chinese. Keep all words together.
+     *
+     * Interim translations may change as the recognizer gets more evidence;
+     * they never clear the last Chinese subtitle while awaiting an answer.
      */
     private void handlePartial(String text) {
         if (!running || !keepRecording || text.isEmpty() || text.equals(lastPartialText)) return;
         lastPartialText = text;
-        // Vosk may emit a punctuation-free paragraph. Show only the most recent
-        // clause, not all of it in a single unreadable subtitle.
-        int chunkIndex = CaptionText.visibleChunkIndex(text);
-        String current = CaptionText.visibleTail(text);
-        if (current.isEmpty()) return;
-        if (chunkIndex > lastPartialChunkIndex) {
-            activeSpeechSegmentId++;
-            lastTranslationAt = 0L;
-        }
-        lastPartialChunkIndex = chunkIndex;
-        english = CaptionText.forTranslation(current, false);
-        updateOverlay(); // Keep existing Chinese on screen while the model works.
+        String whole = CaptionText.tidy(text);
+        if (whole.isEmpty()) return;
+        String prepared = CaptionText.forTranslation(whole, false);
+        english = prepared;
+        updateOverlay();
 
-        // Translating every one- or two-word hypothesis makes Chinese jump around
-        // and reduces quality. Wait for a short phrase; final results are always translated.
-        if (CaptionText.wordCount(current) < MIN_PARTIAL_WORDS) return;
+        int words = CaptionText.wordCount(whole);
+        if (words < MIN_PARTIAL_WORDS) return;
+        if (words - lastTranslatedPartialWords < MIN_NEW_WORDS_FOR_TRANSLATION) return;
         long now = SystemClock.elapsedRealtime();
-        if (now - lastTranslationAt < 1650L) return;
+        if (now - lastTranslationAt < PARTIAL_TRANSLATION_INTERVAL_MS) return;
         lastTranslationAt = now;
-        requestTranslation(CaptionText.forTranslation(current, false), activeSpeechSegmentId, false, null);
+        lastTranslatedPartialWords = words;
+        requestTranslation(prepared, activeSpeechSegmentId, false, null);
     }
 
     private void handleFinal(String json) {
         if (!running || !keepRecording) return;
-        // A Vosk endpoint is a pause, not necessarily a grammatical sentence.
-        // When several sentences arrive together, divide them into readable clauses.
         lastPartialText = "";
-        lastPartialChunkIndex = 0;
+        lastTranslatedPartialWords = 0;
         lastTranslationAt = 0L;
-        String text = parse(json, "text");
+        String text = CaptionText.tidy(parse(json, "text"));
         if (text.isEmpty()) {
-            activeSpeechSegmentId++;
+            // In quiet sections Vosk can return an empty final result.
+            // Do not advance the segment ID or replace a readable subtitle.
             return;
         }
-        List<String> clauses = splitTimedResult(json, text);
-        if (clauses.isEmpty()) {
-            activeSpeechSegmentId++;
-            return;
-        }
-        // Each translated clause gets its own history entry and source text.
-        // Only the newest clause stays in the floating live subtitle.
-        for (String clause : clauses) {
-            long segmentId = activeSpeechSegmentId++;
-            String prepared = CaptionText.forTranslation(clause, true);
-            CaptionHistory.Line line = history.add(prepared);
-            if (line != null) history.complete(line, "");
-            english = prepared;
-            updateOverlay();
-            requestTranslation(prepared, segmentId, true, line);
-        }
-    }
 
-    private static List<String> splitTimedResult(String json, String fallback) {
-        try {
-            JSONArray data = new JSONObject(json).optJSONArray("result");
-            if (data == null || data.length() == 0) return CaptionText.split(fallback);
-            List<CaptionText.TimedWord> words = new ArrayList<>();
-            for (int i = 0; i < data.length(); i++) {
-                JSONObject w = data.optJSONObject(i);
-                if (w == null) continue;
-                words.add(new CaptionText.TimedWord(w.optString("word", ""),
-                    w.optDouble("start", 0.0), w.optDouble("end", 0.0)));
-            }
-            return CaptionText.splitTimed(words, fallback);
-        } catch (Exception e) {
-            return CaptionText.split(fallback);
-        }
+        // The final result is one utterance. Do NOT split at 0.42-second
+        // word gaps, every 11 words, or conjunctions like "because".
+        // Vosk does not reliably restore punctuation; splitting text by
+        // length is display formatting, never a safe translation boundary.
+        long segmentId = activeSpeechSegmentId++;
+        String prepared = CaptionText.forTranslation(text, true);
+        CaptionHistory.Line line = history.add(prepared);
+        english = prepared;
+        updateOverlay(); // retain the Chinese until final translation is ready
+        requestTranslation(prepared, segmentId, true, line);
     }
 
     /**
