@@ -22,8 +22,15 @@ public final class ModelInstaller {
     private static final String MODEL_NAME = "vosk-model-small-en-us-0.15";
     private static final String MODEL_URL = "https://alphacephei.com/vosk/models/" + MODEL_NAME + ".zip";
     private static final String SHA256 = "30f26242c4eb449f948e42cb302dd7a686cb29a3423a8367f99ff41780942498";
-    private static final long MAX_ARCHIVE_BYTES = 100L * 1024L * 1024L;
-    private static final long MAX_EXPANDED_BYTES = 250L * 1024L * 1024L;
+    private static final String HIGH_NAME = "vosk-model-en-us-0.22-lgraph";
+    // Pinned open-source model mirror, with fixed archive SHA-256 from the host.
+    private static final String HIGH_URL =
+        "https://huggingface.co/rhasspy/vosk-models/resolve/" +
+        "e7ac2109d134b5f2404ba95389b2fb51916d4cab/en/" + HIGH_NAME + ".zip";
+    private static final String HIGH_SHA256 =
+        "d9838b4aaa82a75c4a17f5aca300eaca129aaab2a7cbf951bafbb500eb9c4334";
+    private static final long MAX_ARCHIVE_BYTES = 170L * 1024L * 1024L;
+    private static final long MAX_EXPANDED_BYTES = 650L * 1024L * 1024L;
     public interface Listener {
         void update(String message);
         void finished(boolean success, String message);
@@ -31,49 +38,90 @@ public final class ModelInstaller {
 
     private ModelInstaller() {}
 
-    public static File path(Context context) {
-        return new File(context.getFilesDir(), MODEL_NAME);
+    private static File modelPath(Context context, String modelName) {
+        return new File(context.getFilesDir(), modelName);
     }
 
-    public static boolean isInstalled(Context context) {
-        File root = path(context);
+    private static boolean hasStructure(File root) {
         return new File(root, "am").isDirectory()
             && new File(root, "conf").isDirectory()
             && new File(root, "graph").isDirectory();
     }
 
+    public static boolean isEnhancedInstalled(Context context) {
+        return hasStructure(modelPath(context, HIGH_NAME));
+    }
+
+    public static boolean isEnhancedSelected(Context context) {
+        return isEnhancedInstalled(context)
+            && context.getSharedPreferences("settings", Context.MODE_PRIVATE)
+                .getBoolean("enhancedSpeech", false);
+    }
+
+    public static void setEnhancedSelected(Context context, boolean enabled) {
+        context.getSharedPreferences("settings", Context.MODE_PRIVATE)
+            .edit().putBoolean("enhancedSpeech", enabled && isEnhancedInstalled(context)).apply();
+    }
+
+    public static File path(Context context) {
+        if (isEnhancedSelected(context)) return modelPath(context, HIGH_NAME);
+        File standard = modelPath(context, MODEL_NAME);
+        return hasStructure(standard) ? standard : modelPath(context, HIGH_NAME);
+    }
+
+    public static boolean isInstalled(Context context) {
+        return hasStructure(modelPath(context, MODEL_NAME)) || isEnhancedInstalled(context);
+    }
+
+    /** Normal setup reuses any existing model; never downloads the 128 MB one silently. */
     public static void download(Context context, Listener listener) {
+        if (isInstalled(context)) {
+            new Handler(Looper.getMainLooper()).post(() -> listener.finished(true, "語音模型已安裝"));
+        } else {
+            downloadModel(context, MODEL_NAME, MODEL_URL, SHA256, false, listener);
+        }
+    }
+
+    public static void downloadEnhanced(Context context, Listener listener) {
+        if (isEnhancedInstalled(context)) {
+            setEnhancedSelected(context, true);
+            new Handler(Looper.getMainLooper()).post(() -> listener.finished(true, "較準確英文模型已啟用"));
+        } else {
+            downloadModel(context, HIGH_NAME, HIGH_URL, HIGH_SHA256, true, listener);
+        }
+    }
+
+    private static void downloadModel(Context context, String modelName, String source,
+                                      String hash, boolean enhanced, Listener listener) {
         final Context appContext = context.getApplicationContext();
         Handler main = new Handler(Looper.getMainLooper());
         new Thread(() -> {
-            File zip = new File(appContext.getCacheDir(), MODEL_NAME + ".zip.download");
-            File tempDir = new File(appContext.getFilesDir(), MODEL_NAME + ".unpacking");
+            File zip = new File(appContext.getCacheDir(), modelName + ".zip.download");
+            File tempDir = new File(appContext.getFilesDir(), modelName + ".unpacking");
             try {
-                if (isInstalled(appContext)) {
+                File destination = modelPath(appContext, modelName);
+                if (hasStructure(destination)) {
+                    if (enhanced) setEnhancedSelected(appContext, true);
                     main.post(() -> listener.finished(true, "語音模型已安裝"));
                     return;
                 }
                 deleteRecursively(tempDir);
-                post(main, listener, "正在下載英文語音模型（約 40 MB）…");
-                downloadZip(zip, percent -> post(main, listener, "下載語音模型：" + percent + "%"));
-                post(main, listener, "正在核對下載檔案及解壓縮…");
-                if (!SHA256.equalsIgnoreCase(sha256(zip))) {
-                    throw new IOException("語音模型 SHA-256 驗證失敗，已拒絕安裝");
+                post(main, listener, enhanced ? "正在下載較準確英文模型（約128 MB）…" :
+                    "正在下載英文語音模型（約40 MB）…");
+                downloadZip(source, zip, percent -> post(main, listener, "下載語音模型：" + percent + "%"));
+                post(main, listener, "正在檢查 SHA-256 及解壓縮…");
+                if (!hash.equalsIgnoreCase(sha256(zip))) {
+                    throw new IOException("模型 SHA-256 驗證失敗，已拒絕安裝");
                 }
                 if (!tempDir.mkdirs()) throw new IOException("無法建立模型暫存資料夾");
                 unpack(zip, tempDir);
-                File extracted = new File(tempDir, MODEL_NAME);
-                if (!new File(extracted, "am").isDirectory()
-                    || !new File(extracted, "conf").isDirectory()
-                    || !new File(extracted, "graph").isDirectory()) {
-                    throw new IOException("模型 ZIP 結構不符合預期");
-                }
-                File destination = path(appContext);
-                if (destination.exists() && !isInstalled(appContext)) deleteRecursively(destination);
-                if (!extracted.renameTo(destination)) {
-                    throw new IOException("無法完成語音模型安裝");
-                }
-                main.post(() -> listener.finished(true, "英文語音模型安裝完成"));
+                File extracted = new File(tempDir, modelName);
+                if (!hasStructure(extracted)) throw new IOException("模型 ZIP 結構不符合預期");
+                if (destination.exists() && !hasStructure(destination)) deleteRecursively(destination);
+                if (!extracted.renameTo(destination)) throw new IOException("無法完成語音模型安裝");
+                if (enhanced) setEnhancedSelected(appContext, true);
+                main.post(() -> listener.finished(true,
+                    enhanced ? "較準確英文模型已啟用；重新開始字幕即可生效" : "英文語音模型安裝完成"));
             } catch (Exception error) {
                 String info = error.getMessage() == null ? error.toString() : error.getMessage();
                 main.post(() -> listener.finished(false, "下載失敗：" + info));
@@ -81,13 +129,13 @@ public final class ModelInstaller {
                 zip.delete();
                 deleteRecursively(tempDir);
             }
-        }, "Vosk-Model-Downloader").start();
+        }, enhanced ? "Vosk-Enhanced-Downloader" : "Vosk-Model-Downloader").start();
     }
 
     private interface Progress { void update(int pct); }
 
-    private static void downloadZip(File target, Progress progress) throws Exception {
-        HttpsURLConnection conn = (HttpsURLConnection) new URL(MODEL_URL).openConnection();
+    private static void downloadZip(String url, File target, Progress progress) throws Exception {
+        HttpsURLConnection conn = (HttpsURLConnection) new URL(url).openConnection();
         conn.setConnectTimeout(12000);
         conn.setReadTimeout(30000);
         conn.setInstanceFollowRedirects(true);
