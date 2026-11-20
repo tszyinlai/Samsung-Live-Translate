@@ -354,7 +354,7 @@ public final class MainActivity extends Activity {
     private Button button(String text, boolean primary) {
         Button b = new Button(this);
         b.setText(text);
-        b.setTextAllCaps(false);
+        b.setAllCaps(false);
         b.setTextSize(14);
         b.setTextColor(primary ? BG : Color.WHITE);
         b.setBackground(rounded(primary ? ACCENT : 0xFF29364E, 11));
