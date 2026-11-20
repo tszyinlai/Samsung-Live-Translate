@@ -60,7 +60,12 @@ public final class CaptureService extends Service {
     private String lastPartialText = "";
     private long lastTranslationAt = 0L;
     private long lastPartialPostAt = 0L;
-    private long previewSerial = 0L;
+    // Speech and translation have different completion times. Never allow an older
+    // asynchronous translation to replace a newer displayed subtitle.
+    private long activeSpeechSegmentId = 1L;
+    private long displayedSpeechSegmentId = 0L;
+    private long nextTranslationRequestId = 0L;
+    private long lastDisplayedRequestId = 0L;
 
     @Override public IBinder onBind(Intent intent) { return null; }
 
@@ -125,6 +130,13 @@ public final class CaptureService extends Service {
             keepRecording = true;
             english = "";
             chinese = "";
+            lastPartialText = "";
+            lastTranslationAt = 0L;
+            lastPartialPostAt = 0L;
+            activeSpeechSegmentId = 1L;
+            displayedSpeechSegmentId = 0L;
+            nextTranslationRequestId = 0L;
+            lastDisplayedRequestId = 0L;
             status = "正在載入翻譯模型…";
             if (Settings.canDrawOverlays(this)) overlay.show();
             final int actualMode = mode;
@@ -208,7 +220,7 @@ public final class CaptureService extends Service {
                 if (n == 0) continue;
                 if (recognizer.acceptWaveForm(pcm, n)) {
                     String finalEnglish = parse(recognizer.getResult(), "text");
-                    if (!finalEnglish.isEmpty()) ui.post(() -> handleFinal(finalEnglish));
+                    ui.post(() -> handleFinal(finalEnglish));
                 } else {
                     long now = SystemClock.elapsedRealtime();
                     if (now - lastPartialPostAt < 260) continue;
@@ -219,7 +231,7 @@ public final class CaptureService extends Service {
             }
             if (keepRecording) {
                 String finalEnglish = parse(recognizer.getFinalResult(), "text");
-                if (!finalEnglish.isEmpty()) ui.post(() -> handleFinal(finalEnglish));
+                ui.post(() -> handleFinal(finalEnglish));
             }
         } catch (Exception e) {
             if (keepRecording) {
@@ -245,48 +257,105 @@ public final class CaptureService extends Service {
         catch (Exception e) { return ""; }
     }
 
+    /**
+     * Vosk partial text grows as it hears a sentence. Keep the last translated
+     * Chinese visible while waiting for the next translation. In particular, do
+     * NOT replace it with a "recognizing" or "translating" status message.
+     */
     private void handlePartial(String text) {
-        if (!running || !keepRecording || text.equals(lastPartialText)) return;
+        if (!running || !keepRecording || text.isEmpty() || text.equals(lastPartialText)) return;
         lastPartialText = text;
+        // The English recognition is immediate; the latest Chinese translation
+        // stays on screen until a new, nonempty translation actually arrives.
         english = text;
-        chinese = "辨識中…";
         updateOverlay();
+
         long now = SystemClock.elapsedRealtime();
-        // Intermediate translations are expensive. Limit to one request every 1100ms.
-        if (now - lastTranslationAt < 1100) return;
+        // Translate a changing sentence at most about once per second.
+        if (now - lastTranslationAt < 950L) return;
         lastTranslationAt = now;
-        long revision = ++previewSerial;
-        if (translator == null) return;
-        translator.translate(text, new TranslationEngine.Result() {
-            @Override public void success(String zh) {
-                if (running && revision == previewSerial && english.equals(text)) {
-                    chinese = zh;
-                    updateOverlay();
-                }
-            }
-            @Override public void failure(String why) { /* keep English interim visible */ }
-        });
+        requestTranslation(text, activeSpeechSegmentId, false, null);
     }
 
     private void handleFinal(String text) {
-        if (!running || text.isEmpty()) return;
-        ++previewSerial;
+        if (!running || !keepRecording) return;
+        // Even an empty final result closes the Vosk segment. The next partial
+        // then belongs to a new utterance and must not be appended to the old one.
+        long segmentId = activeSpeechSegmentId++;
         lastPartialText = "";
+        lastTranslationAt = 0L;
+        if (text.isEmpty()) return;
+
         english = text;
-        chinese = "翻譯中…";
-        updateOverlay();
+        updateOverlay(); // keep the previous Chinese visible while translating
         CaptionHistory.Line line = history.add(text);
+        // The history panel should not show a temporary "翻譯中" placeholder either.
+        if (line != null) history.complete(line, "");
+        requestTranslation(text, segmentId, true, line);
+    }
+
+    /**
+     * Accept translations in speech order, not callback completion order. A
+     * Vosk segment may have several unfinished partial translations in flight.
+     */
+    private void requestTranslation(String source, long segmentId, boolean isFinal, CaptionHistory.Line line) {
         if (translator == null) return;
-        translator.translate(text, new TranslationEngine.Result() {
-            @Override public void success(String zh) {
-                history.complete(line, zh);
-                if (running && english.equals(text)) { chinese = zh; updateOverlay(); }
+        final long requestId = ++nextTranslationRequestId;
+        translator.translate(source, new TranslationEngine.Result() {
+            @Override public void success(String result) {
+                if (line != null) history.complete(line, result);
+                if (!running || !keepRecording || result == null || result.trim().isEmpty()) return;
+                if (segmentId < displayedSpeechSegmentId) return;
+                if (segmentId == displayedSpeechSegmentId && requestId <= lastDisplayedRequestId) return;
+
+                String fresh = result.trim();
+                // Within one sentence, show the growing translation. If the
+                // model rephrases an earlier word, use its corrected version
+                // rather than accidentally duplicating Chinese words.
+                String next = segmentId == displayedSpeechSegmentId
+                    ? mergeChineseProgress(chinese, fresh, isFinal)
+                    : fresh;
+                if (next.isEmpty()) return;
+                displayedSpeechSegmentId = segmentId;
+                lastDisplayedRequestId = requestId;
+                chinese = next;
+                updateOverlay();
             }
+
             @Override public void failure(String why) {
-                history.complete(line, "[翻譯失敗] " + why);
-                if (running && english.equals(text)) { chinese = "翻譯未完成"; updateOverlay(); }
+                if (line != null) history.complete(line, "[翻譯失敗] " + why);
+                Log.w(TAG, "Translation unavailable; keeping the last subtitle: " + why);
+                // Never cover a readable translation with an error or a placeholder.
             }
         });
+    }
+
+    /**
+     * Cumulative partial translations usually share an opening phrase. Trim
+     * end punctuation before comparing, so e.g. "你好。" can grow into
+     * "你好，今天很高興見到你。" without flashing or repeating "你好".
+     */
+    static String mergeChineseProgress(String previous, String incoming, boolean isFinal) {
+        String oldText = previous == null ? "" : previous.trim();
+        String newText = incoming == null ? "" : incoming.trim();
+        if (newText.isEmpty()) return oldText;
+        if (oldText.isEmpty() || oldText.equals(newText)) return newText;
+        String oldRoot = trimEndingPunctuation(oldText);
+        String newRoot = trimEndingPunctuation(newText);
+        if (!oldRoot.isEmpty() && newRoot.startsWith(oldRoot)) return newText;
+        // Some intermediate recognizer/translator hypotheses briefly shrink.
+        // Do not make already displayed subtitles disappear or jump backwards.
+        if (!isFinal && !newRoot.isEmpty() && oldRoot.startsWith(newRoot)) return oldText;
+        if (!isFinal && newText.length() < oldText.length()) return oldText;
+        // A full-sentence translation may legitimately revise its earlier
+        // wording. Prefer an accurate replacement to appending duplicated text.
+        return newText;
+    }
+
+    private static String trimEndingPunctuation(String text) {
+        int end = text.length();
+        while (end > 0 && "。！？!?，,、；;：:….".indexOf(text.charAt(end - 1)) >= 0) end--;
+        return text.substring(0, end).trim();
     }
 
     private void updateOverlay() { if (overlay != null) overlay.update(english, chinese); }
@@ -294,7 +363,6 @@ public final class CaptureService extends Service {
     @Override public void onDestroy() {
         keepRecording = false;
         running = false;
-        ++previewSerial;
         AudioRecord input = recorder;
         if (input != null) try { input.stop(); } catch (Exception ignored) {}
         if (worker != null) worker.interrupt();
