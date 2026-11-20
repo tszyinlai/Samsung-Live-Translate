@@ -43,6 +43,7 @@ public final class MainActivity extends Activity {
     private TextView chineseText;
     private TextView historyText;
     private Button modelButton;
+    private Button highModelButton;
     private Button micButton;
     private Button playbackButton;
     private Button stopButton;
@@ -107,11 +108,14 @@ public final class MainActivity extends Activity {
         root.addView(card);
 
         textGap(root, 18);
-        root.addView(label("1  首次下載免費模型", 17, Color.WHITE, true));
-        root.addView(label("建議使用 Wi-Fi：英文語音模型約 40 MB，中文翻譯模型亦需下載。完成後可離線使用，不需 API Key。", 13, MUTED, false));
-        modelButton = button("下載／檢查免費模型", false);
+        root.addView(label("1  免費語音與翻譯模型", 17, Color.WHITE, true));
+        root.addView(label("基本英文模型約40 MB。可選擇下載較準確英文模型約128 MB；需要額外手機空間及記憶體，可能較慢。全部免費、本機處理。", 13, MUTED, false));
+        modelButton = button("下載／檢查基本免費模型", false);
         root.addView(modelButton);
         modelButton.setOnClickListener(v -> installModels());
+        highModelButton = button("較準確英文模型（選用，約128 MB）", false);
+        root.addView(highModelButton);
+        highModelButton.setOnClickListener(v -> toggleEnhancedSpeech());
 
         textGap(root, 16);
         root.addView(label("2  選擇聲音來源", 17, Color.WHITE, true));
@@ -199,9 +203,42 @@ public final class MainActivity extends Activity {
         });
     }
 
+    private void toggleEnhancedSpeech() {
+        if (downloading || CaptureService.running) {
+            toast("請先停止字幕再切換或下載英文模型");
+            return;
+        }
+        if (ModelInstaller.isEnhancedInstalled(this)) {
+            boolean useEnhanced = !ModelInstaller.isEnhancedSelected(this);
+            ModelInstaller.setEnhancedSelected(this, useEnhanced);
+            toast(useEnhanced ? "已選擇較準確英文模型，下一次啟動生效" : "已切回基本英文模型");
+            return;
+        }
+        new AlertDialog.Builder(this)
+            .setTitle("下載較準確英文模型？")
+            .setMessage("需要約128 MB 下載，加上解壓後的額外儲存空間。較大的模型可能較準確，但手機記憶體使用量及延遲亦會增加。不會產生 API 或訂閱費，建議使用 Wi-Fi。")
+            .setNegativeButton("取消", null)
+            .setPositiveButton("下載並啟用", (dialog, which) -> installEnhancedSpeech())
+            .show();
+    }
+
+    private void installEnhancedSpeech() {
+        if (downloading || CaptureService.running) return;
+        downloading = true;
+        highModelButton.setEnabled(false);
+        statusText.setText("正在下載較準確英文模型…");
+        ModelInstaller.downloadEnhanced(this, new ModelInstaller.Listener() {
+            @Override public void update(String info) { statusText.setText(info); }
+            @Override public void finished(boolean success, String info) {
+                finishInstall(success, info);
+            }
+        });
+    }
+
     private void finishInstall(boolean ok, String info) {
         downloading = false;
         modelButton.setEnabled(true);
+        if (highModelButton != null) highModelButton.setEnabled(!CaptureService.running);
         statusText.setText(info);
         if (!CaptureService.running) CaptureService.status = info;
         if (ok) toast("模型準備完成，可以開始翻譯");
@@ -317,6 +354,16 @@ public final class MainActivity extends Activity {
         micButton.setEnabled(!running && !downloading);
         playbackButton.setEnabled(!running && !downloading);
         stopButton.setEnabled(running);
+        if (modelButton != null) modelButton.setEnabled(!running && !downloading);
+        if (highModelButton != null) {
+            highModelButton.setEnabled(!running && !downloading);
+            String modelLabel = !ModelInstaller.isEnhancedInstalled(this)
+                ? "下載較準確英文模型（約128 MB，選用）"
+                : (ModelInstaller.isEnhancedSelected(this)
+                    ? "目前：較準確英文模型（點擊切回基本模式）"
+                    : "已下載較準確模型（點擊啟用）");
+            if (!modelLabel.equals(highModelButton.getText().toString())) highModelButton.setText(modelLabel);
+        }
         String transcript = CaptureService.history.asText();
         if (transcript.isEmpty()) transcript = "字幕紀錄尚未產生";
         if (!historyText.getText().toString().equals(transcript)) historyText.setText(transcript);
