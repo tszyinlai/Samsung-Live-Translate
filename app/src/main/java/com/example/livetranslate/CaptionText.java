@@ -3,7 +3,6 @@ package com.example.livetranslate;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-import java.util.Locale;
 import java.util.regex.Pattern;
 
 /**
@@ -11,8 +10,6 @@ import java.util.regex.Pattern;
  * This is caption layout, not a learned punctuation or translation model.
  */
 public final class CaptionText {
-    private static final int MAX_WORDS = 11;
-    private static final int MAX_CHARS = 76;
     private static final Pattern SPACES = Pattern.compile("\\s+");
     private static final Pattern QUESTION_START = Pattern.compile(
         "^(what|why|where|when|who|whom|whose|which|how|can|could|would|will|should|" +
@@ -30,60 +27,36 @@ public final class CaptionText {
         return clean.isEmpty() ? 0 : clean.split(" ").length;
     }
 
-    /** Keep the real-time overlay on the most recent, reasonably short clause. */
-    public static String visibleTail(String speech) {
-        List<String> pieces = split(speech);
-        return pieces.isEmpty() ? "" : pieces.get(pieces.size() - 1);
-    }
+    /**
+     * Compatibility helpers for old callers. The entire hypothesis is
+     * intentional: a visual line-break must never truncate translation input.
+     */
+    public static String visibleTail(String speech) { return tidy(speech); }
+    public static int visibleChunkIndex(String speech) { return 0; }
 
-    public static int visibleChunkIndex(String speech) {
-        return Math.max(0, split(speech).size() - 1);
-    }
-
-    /** Preserve every recognized word; split at punctuation or safe length limits. */
+    /**
+     * Punctuation-only splitting: never split by word count, line width,
+     * a small silence, or a conjunction. Vosk often provides NO punctuation,
+     * in which case the whole utterance must remain intact for translation.
+     */
     public static List<String> split(String speech) {
         String text = tidy(speech);
         if (text.isEmpty()) return Collections.emptyList();
-        String[] words = text.split(" ");
         List<String> result = new ArrayList<>();
-        StringBuilder current = new StringBuilder();
-        int count = 0;
+        String[] words = text.split(" ");
+        StringBuilder part = new StringBuilder();
         for (String word : words) {
-            boolean nextClause = isClauseStarter(word);
-            if (count >= 6 && nextClause) {
-                result.add(current.toString());
-                current.setLength(0);
-                count = 0;
-            }
-            if (count >= MAX_WORDS || (count >= 6 && current.length() + 1 + word.length() > MAX_CHARS)) {
-                result.add(current.toString());
-                current.setLength(0);
-                count = 0;
-            }
-            if (current.length() > 0) current.append(' ');
-            current.append(word);
-            count++;
-            if (endsSentence(word)) {
-                result.add(current.toString());
-                current.setLength(0);
-                count = 0;
+            if (part.length() > 0) part.append(' ');
+            part.append(word);
+            if (word.endsWith(".") || word.endsWith("?") || word.endsWith("!")) {
+                result.add(part.toString());
+                part.setLength(0);
             }
         }
-        if (current.length() > 0) result.add(current.toString());
+        if (part.length() > 0) result.add(part.toString());
         return result;
     }
 
-    private static boolean isClauseStarter(String word) {
-        String w = word.toLowerCase(Locale.ROOT).replaceAll("[^a-z]", "");
-        return "but".equals(w) || "however".equals(w) || "because".equals(w)
-            || "therefore".equals(w) || "then".equals(w) || "although".equals(w);
-    }
-
-    private static boolean endsSentence(String word) {
-        return word.endsWith(".") || word.endsWith("?") || word.endsWith("!");
-    }
-
-    /** Vosk word timestamps make pauses visible even inside one final recognition result. */
     public static final class TimedWord {
         public final String word;
         public final double start;
@@ -95,28 +68,16 @@ public final class CaptionText {
         }
     }
 
+    /** Word timestamps can help VAD, but 0.42 s does NOT mean a full stop. */
     public static List<String> splitTimed(List<TimedWord> words, String fallback) {
         if (words == null || words.isEmpty()) return split(fallback);
-        List<String> pieces = new ArrayList<>();
-        StringBuilder current = new StringBuilder();
-        int count = 0;
-        double previousEnd = -1.0;
-        for (TimedWord w : words) {
-            if (w == null || w.word.isEmpty()) continue;
-            // Gaps near half a second are often sentence or clause boundaries.
-            boolean pause = previousEnd >= 0 && w.start - previousEnd >= 0.42;
-            if (pause && count >= 3) {
-                pieces.addAll(split(current.toString()));
-                current.setLength(0);
-                count = 0;
-            }
-            if (current.length() > 0) current.append(' ');
-            current.append(w.word);
-            count++;
-            previousEnd = w.end;
+        StringBuilder all = new StringBuilder();
+        for (TimedWord word : words) {
+            if (word == null || word.word.isEmpty()) continue;
+            if (all.length() > 0) all.append(' ');
+            all.append(word.word);
         }
-        if (current.length() > 0) pieces.addAll(split(current.toString()));
-        return pieces.isEmpty() ? split(fallback) : pieces;
+        return split(all.length() > 0 ? all.toString() : fallback);
     }
 
     /** Capitalisation and punctuation give the small on-device translation model context. */
