@@ -26,8 +26,12 @@ import android.provider.Settings;
 import android.util.Log;
 
 import org.json.JSONObject;
+import org.json.JSONArray;
 import org.vosk.Model;
 import org.vosk.Recognizer;
+
+import java.util.List;
+import java.util.ArrayList;
 
 /** A foreground service is required for microphone or MediaProjection capture on modern Android. */
 public final class CaptureService extends Service {
@@ -60,12 +64,15 @@ public final class CaptureService extends Service {
     private String lastPartialText = "";
     private long lastTranslationAt = 0L;
     private long lastPartialPostAt = 0L;
+    private int lastPartialChunkIndex = 0;
+    private static final int MIN_PARTIAL_WORDS = 5;
     // Speech and translation have different completion times. Never allow an older
     // asynchronous translation to replace a newer displayed subtitle.
     private long activeSpeechSegmentId = 1L;
     private long displayedSpeechSegmentId = 0L;
     private long nextTranslationRequestId = 0L;
     private long lastDisplayedRequestId = 0L;
+    private long newestRequestedSegmentId = 0L;
 
     @Override public IBinder onBind(Intent intent) { return null; }
 
@@ -133,10 +140,12 @@ public final class CaptureService extends Service {
             lastPartialText = "";
             lastTranslationAt = 0L;
             lastPartialPostAt = 0L;
+            lastPartialChunkIndex = 0;
             activeSpeechSegmentId = 1L;
             displayedSpeechSegmentId = 0L;
             nextTranslationRequestId = 0L;
             lastDisplayedRequestId = 0L;
+            newestRequestedSegmentId = 0L;
             status = "正在載入翻譯模型…";
             if (Settings.canDrawOverlays(this)) overlay.show();
             final int actualMode = mode;
@@ -209,6 +218,10 @@ public final class CaptureService extends Service {
     private void captureLoop(int mode) {
         try (Model model = new Model(ModelInstaller.path(this).getAbsolutePath());
              Recognizer recognizer = new Recognizer(model, SAMPLE_RATE)) {
+            // Vosk's defaults can join several spoken sentences without punctuation.
+            // Prefer a boundary after ~0.45 s silence, with a ~6.5 s safety limit.
+            recognizer.setEndpointerDelays(5.0f, 0.45f, 6.5f);
+            recognizer.setWords(true);
             AudioRecord input = buildRecorder(mode);
             recorder = input;
             input.startRecording();
@@ -219,8 +232,8 @@ public final class CaptureService extends Service {
                 if (n < 0) throw new IllegalStateException("讀取聲音失敗 (" + n + ")");
                 if (n == 0) continue;
                 if (recognizer.acceptWaveForm(pcm, n)) {
-                    String finalEnglish = parse(recognizer.getResult(), "text");
-                    ui.post(() -> handleFinal(finalEnglish));
+                    String finalJson = recognizer.getResult();
+                    ui.post(() -> handleFinal(finalJson));
                 } else {
                     long now = SystemClock.elapsedRealtime();
                     if (now - lastPartialPostAt < 260) continue;
@@ -230,8 +243,8 @@ public final class CaptureService extends Service {
                 }
             }
             if (keepRecording) {
-                String finalEnglish = parse(recognizer.getFinalResult(), "text");
-                ui.post(() -> handleFinal(finalEnglish));
+                String finalJson = recognizer.getFinalResult();
+                ui.post(() -> handleFinal(finalJson));
             }
         } catch (Exception e) {
             if (keepRecording) {
@@ -265,33 +278,73 @@ public final class CaptureService extends Service {
     private void handlePartial(String text) {
         if (!running || !keepRecording || text.isEmpty() || text.equals(lastPartialText)) return;
         lastPartialText = text;
-        // The English recognition is immediate; the latest Chinese translation
-        // stays on screen until a new, nonempty translation actually arrives.
-        english = text;
-        updateOverlay();
+        // Vosk may emit a punctuation-free paragraph. Show only the most recent
+        // clause, not all of it in a single unreadable subtitle.
+        int chunkIndex = CaptionText.visibleChunkIndex(text);
+        String current = CaptionText.visibleTail(text);
+        if (current.isEmpty()) return;
+        if (chunkIndex > lastPartialChunkIndex) {
+            activeSpeechSegmentId++;
+            lastTranslationAt = 0L;
+        }
+        lastPartialChunkIndex = chunkIndex;
+        english = CaptionText.forTranslation(current, false);
+        updateOverlay(); // Keep existing Chinese on screen while the model works.
 
+        // Translating every one- or two-word hypothesis makes Chinese jump around
+        // and reduces quality. Wait for a short phrase; final results are always translated.
+        if (CaptionText.wordCount(current) < MIN_PARTIAL_WORDS) return;
         long now = SystemClock.elapsedRealtime();
-        // Translate a changing sentence at most about once per second.
-        if (now - lastTranslationAt < 950L) return;
+        if (now - lastTranslationAt < 1650L) return;
         lastTranslationAt = now;
-        requestTranslation(text, activeSpeechSegmentId, false, null);
+        requestTranslation(CaptionText.forTranslation(current, false), activeSpeechSegmentId, false, null);
     }
 
-    private void handleFinal(String text) {
+    private void handleFinal(String json) {
         if (!running || !keepRecording) return;
-        // Even an empty final result closes the Vosk segment. The next partial
-        // then belongs to a new utterance and must not be appended to the old one.
-        long segmentId = activeSpeechSegmentId++;
+        // A Vosk endpoint is a pause, not necessarily a grammatical sentence.
+        // When several sentences arrive together, divide them into readable clauses.
         lastPartialText = "";
+        lastPartialChunkIndex = 0;
         lastTranslationAt = 0L;
-        if (text.isEmpty()) return;
+        String text = parse(json, "text");
+        if (text.isEmpty()) {
+            activeSpeechSegmentId++;
+            return;
+        }
+        List<String> clauses = splitTimedResult(json, text);
+        if (clauses.isEmpty()) {
+            activeSpeechSegmentId++;
+            return;
+        }
+        // Each translated clause gets its own history entry and source text.
+        // Only the newest clause stays in the floating live subtitle.
+        for (String clause : clauses) {
+            long segmentId = activeSpeechSegmentId++;
+            String prepared = CaptionText.forTranslation(clause, true);
+            CaptionHistory.Line line = history.add(prepared);
+            if (line != null) history.complete(line, "");
+            english = prepared;
+            updateOverlay();
+            requestTranslation(prepared, segmentId, true, line);
+        }
+    }
 
-        english = text;
-        updateOverlay(); // keep the previous Chinese visible while translating
-        CaptionHistory.Line line = history.add(text);
-        // The history panel should not show a temporary "翻譯中" placeholder either.
-        if (line != null) history.complete(line, "");
-        requestTranslation(text, segmentId, true, line);
+    private static List<String> splitTimedResult(String json, String fallback) {
+        try {
+            JSONArray data = new JSONObject(json).optJSONArray("result");
+            if (data == null || data.length() == 0) return CaptionText.split(fallback);
+            List<CaptionText.TimedWord> words = new ArrayList<>();
+            for (int i = 0; i < data.length(); i++) {
+                JSONObject w = data.optJSONObject(i);
+                if (w == null) continue;
+                words.add(new CaptionText.TimedWord(w.optString("word", ""),
+                    w.optDouble("start", 0.0), w.optDouble("end", 0.0)));
+            }
+            return CaptionText.splitTimed(words, fallback);
+        } catch (Exception e) {
+            return CaptionText.split(fallback);
+        }
     }
 
     /**
@@ -301,10 +354,12 @@ public final class CaptureService extends Service {
     private void requestTranslation(String source, long segmentId, boolean isFinal, CaptionHistory.Line line) {
         if (translator == null) return;
         final long requestId = ++nextTranslationRequestId;
+        newestRequestedSegmentId = Math.max(newestRequestedSegmentId, segmentId);
         translator.translate(source, new TranslationEngine.Result() {
             @Override public void success(String result) {
                 if (line != null) history.complete(line, result);
                 if (!running || !keepRecording || result == null || result.trim().isEmpty()) return;
+                if (segmentId < newestRequestedSegmentId) return;
                 if (segmentId < displayedSpeechSegmentId) return;
                 if (segmentId == displayedSpeechSegmentId && requestId <= lastDisplayedRequestId) return;
 
