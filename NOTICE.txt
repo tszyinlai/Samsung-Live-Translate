@@ -1,0 +1,16 @@
+Live Translate Captions - Android Edition
+
+Project code authored for the requesting user in 2026.
+
+Third-party components downloaded when building or running:
+- Vosk Android library (com.alphacephei:vosk-android), Apache License 2.0.
+  https://github.com/alphacep/vosk-api
+- Vosk English Small 0.15 acoustic model, Apache License 2.0.
+  https://alphacephei.com/vosk/models
+- Google ML Kit on-device translation, subject to Google's terms and attribution guidelines.
+  https://developers.google.com/ml-kit/language/translation/translation-terms
+- Android ICU transliterator from the Android OS.
+
+No API keys, account credentials, or speech/audio files are included.
+Using the bundled debug building method is for personal testing; release publishing requires testing,
+security review, appropriate privacy disclosures, signing and compliance with third-party licensing.

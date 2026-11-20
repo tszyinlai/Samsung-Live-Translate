@@ -1,0 +1,31 @@
+plugins {
+    id 'com.android.application'
+}
+android {
+    namespace 'com.example.livetranslate'
+    compileSdk 35
+    defaultConfig {
+        applicationId 'com.example.livetranslate'
+        minSdk 29
+        targetSdk 35
+        versionCode 1
+        versionName '0.1.0-beta'
+    }
+    buildTypes {
+        release { minifyEnabled false }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    packaging {
+        jniLibs { useLegacyPackaging true }
+    }
+}
+dependencies {
+    // Free, locally running streaming speech-to-text for Android
+    implementation 'com.alphacephei:vosk-android:0.3.75'
+    // Free on-device translation model; not the billed Google Cloud Translation API
+    implementation 'com.google.mlkit:translate:17.0.3'
+    testImplementation 'junit:junit:4.13.2'
+}
